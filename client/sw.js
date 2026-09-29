@@ -1,39 +1,83 @@
 // ─────────────────────────────────────────────────────────────────────────
-// HTMLTools Browser — proxy engine (service worker).
+// HTMLTools Browser — proxy engine (service worker). v1.1
 //
-// This is what makes it fast, and why it beats GUST's approach:
-//   • No WASM curl, no WebSocket relay. Plain streaming fetch().
-//   • Zero CORS preflights: forwarded headers ride inside the URL (?hd=),
-//    so every request is a CORS-simple request.
-//   • Subresources (img/js/font/...) stream straight through untouched —
-//     only HTML + CSS are rewritten, and the browser caches them normally.
+// Fast by design: streaming fetch, zero CORS preflights (?hd= trick),
+// only HTML/CSS rewritten, everything else streams untouched, normal
+// browser caching for subresources.
+//
+// v1.1 "real browser" upgrades:
+//   • Persistent cookie store (IndexedDB) with Domain/Path/Expires/
+//     Secure/HttpOnly semantics — logins survive restarts
+//   • Backend URL baked into the injected runtime (WebSocket proxying)
 // ─────────────────────────────────────────────────────────────────────────
-import { BACKEND } from './config.js';
+import { BACKEND, KEY } from './config.js';
 import { encodeUrl, decodeUrl, b64urlEncode } from './encoder.js';
 import { rewriteHtml, rewriteCss } from './rewrite.js';
+import { makeStore, parseSetCookie } from './cookiestore.js';
 
-const VERSION = 'v1.0.0';
+const VERSION = 'v1.1.0';
 const SCOPE = new URL(self.registration.scope).pathname; // '/' or '/browser/'
 const ROOT = SCOPE.replace(/\/$/, ''); // '' or '/browser'
 const RUNTIME_PATH = ROOT + '/~/__ht/runtime.js';
 const COOKIES_PATH = ROOT + '/~/__ht/cookies';
 const SYNC_PATH = ROOT + '/~/__ht/sync';
 
-// Per-real-origin cookie jars (page JS cookies + upstream Set-Cookie).
-const jars = new Map();
-// Set-Cookie headers waiting to be handed to the page runtime.
-const pendingSet = new Map();
-// Backend override (set via postMessage from the app — handy for local dev).
+// ── cookie store + persistence (IndexedDB) ──────────────────────────────
+const store = makeStore();
+const pendingSet = new Map(); // origin → Set-Cookie strings for the page runtime
+
+const dbP = new Promise((resolve) => {
+  try {
+    const req = indexedDB.open('htmltools-kv', 1);
+    req.onupgradeneeded = () => req.result.createObjectStore('kv');
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => resolve(null);
+  } catch {
+    resolve(null);
+  }
+});
+
+function idbOp(mode, fn) {
+  return dbP.then(
+    (db) =>
+      new Promise((resolve, reject) => {
+        if (!db) return resolve();
+        const tx = db.transaction('kv', mode);
+        const out = fn(tx.objectStore('kv'));
+        tx.oncomplete = () => resolve(out && out.result);
+        tx.onerror = () => reject(tx.error);
+      })
+  );
+}
+
+let persistTimer = null;
+function persistCookies() {
+  clearTimeout(persistTimer);
+  persistTimer = setTimeout(() => {
+    idbOp('readwrite', (s) => s.put(store.toJSON(), 'cookies')).catch(() => {});
+  }, 250);
+}
+
+// Load persisted cookies at startup, before any request uses them.
+const storeReady = idbOp('readonly', (s) => s.get('cookies'))
+  .then((list) => {
+    store.load(list);
+  })
+  .catch(() => {});
+
 let backend = BACKEND;
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
     (async () => {
       const cache = await caches.open('htmltools-' + VERSION);
-      await cache.addAll(['./', './index.html', './app.js', './config.js', './encoder.js', './rewrite.js']);
-      // Bake the real KEY + prefix into runtime.js so it always matches.
+      await cache.addAll(['./', './index.html', './app.js', './config.js', './encoder.js', './rewrite.js', './cookiestore.js']);
+      // Bake real KEY + prefix + backend into runtime.js so it always matches.
       const raw = await (await fetch('./runtime.js')).text();
-      const baked = raw.replaceAll('__HT_KEY__', KEY_OF()).replaceAll('__HT_PREFIX__', SCOPE);
+      const baked = raw
+        .replaceAll('__HT_KEY__', KEY)
+        .replaceAll('__HT_PREFIX__', SCOPE)
+        .replaceAll('__HT_BACKEND__', backend);
       await cache.put(RUNTIME_PATH, new Response(baked, { headers: { 'content-type': 'text/javascript; charset=utf-8' } }));
       await self.skipWaiting();
     })()
@@ -64,7 +108,6 @@ self.addEventListener('fetch', (event) => {
   const url = new URL(req.url);
   if (url.origin !== self.location.origin) return;
 
-  // Internal endpoints
   if (url.pathname === RUNTIME_PATH) {
     event.respondWith(caches.match(RUNTIME_PATH).then((r) => r || fetch('./runtime.js')));
     return;
@@ -78,7 +121,6 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Proxied traffic: anything under <root>/~/
   const target = decodeUrl(url.pathname);
   if (!target || !/^https?:/i.test(target)) return; // normal app traffic
   event.respondWith(handle(req, target));
@@ -86,7 +128,11 @@ self.addEventListener('fetch', (event) => {
 
 // ── core proxy ───────────────────────────────────────────────────────────
 async function handle(request, targetUrl) {
-  const tOrigin = new URL(targetUrl).origin;
+  await storeReady;
+  let tURL;
+  try { tURL = new URL(targetUrl); } catch {
+    return new Response('bad target', { status: 400 });
+  }
 
   // Headers we want upstream (sent inside ?hd= to avoid CORS preflights).
   const fwd = {};
@@ -100,14 +146,14 @@ async function handle(request, targetUrl) {
   if (ref) {
     try { decRef = decodeUrl(new URL(ref).pathname); } catch {}
   }
-  fwd['referer'] = decRef && /^https?:/i.test(decRef) ? decRef : tOrigin + '/';
+  fwd['referer'] = decRef && /^https?:/i.test(decRef) ? decRef : tURL.origin + '/';
 
-  const cookie = jars.get(tOrigin);
+  const cookie = store.forUrl(tURL);
   if (cookie) fwd['cookie'] = cookie;
-  if (request.method !== 'GET' && request.method !== 'HEAD') fwd['origin'] = tOrigin;
+  if (request.method !== 'GET' && request.method !== 'HEAD') fwd['origin'] = tURL.origin;
 
-  // Keep the request CORS-simple: body content-type must be safelisted or
-  // the browser preflights. The REAL content type travels inside ?hd=.
+  // Keep the request CORS-simple: safelisted content-type or none in the
+  // actual body headers; the REAL one travels inside ?hd=.
   const ct = fwd['content-type'];
   const bodyCT = ct && /^(text\/plain|application\/x-www-form-urlencoded|multipart\/form-data)/i.test(ct)
     ? ct
@@ -116,11 +162,7 @@ async function handle(request, targetUrl) {
 
   let resp;
   try {
-    const init = {
-      method: request.method,
-      redirect: 'manual',
-      cache: 'no-store',
-    };
+    const init = { method: request.method, redirect: 'manual', cache: 'no-store' };
     if (request.method !== 'GET' && request.method !== 'HEAD') {
       init.body = await request.arrayBuffer();
       init.headers = { 'content-type': bodyCT || 'text/plain;charset=UTF-8' };
@@ -137,9 +179,8 @@ async function handle(request, targetUrl) {
   let meta = {};
   try { meta = JSON.parse(resp.headers.get('x-proxy-headers') || '{}'); } catch {}
 
-  // Upstream Set-Cookie → jar (+ pending for the page runtime).
   const setCookies = meta['set-cookie'] || [];
-  if (setCookies.length) storeCookies(tOrigin, setCookies);
+  if (setCookies.length) storeCookies(tURL.origin, setCookies);
 
   // Upstream redirect → synthetic redirect to the encoded location.
   if (meta.location && status >= 300 && status < 400) {
@@ -192,39 +233,29 @@ function respondRedirect(abs, status) {
   return Response.redirect(new URL(encodeUrl(abs, SCOPE), self.registration.scope).href, code);
 }
 
-// ── cookie engine v1 ─────────────────────────────────────────────────────
+// ── cookie engine ────────────────────────────────────────────────────────
 function storeCookies(origin, setCookies) {
-  const jar = jarMap(jars.get(origin));
   const pending = pendingSet.get(origin) || [];
   for (const sc of setCookies) {
-    const first = String(sc).split(';')[0];
-    const i = first.indexOf('=');
-    if (i > 0) jar.set(first.slice(0, i).trim(), first.slice(i + 1).trim());
-    pending.push(String(sc));
+    const rec = parseSetCookie(sc, origin + '/');
+    if (!rec) continue;
+    store.set(rec);
+    if (!rec.httpOnly) pending.push(rec.name + '=' + rec.value);
   }
-  jars.set(origin, jarString(jar));
-  pendingSet.set(origin, pending.slice(-50)); // don't grow unbounded
-}
-
-function jarMap(str) {
-  const m = new Map();
-  for (const pair of (str || '').split(';')) {
-    const i = pair.indexOf('=');
-    if (i > 0) m.set(pair.slice(0, i).trim(), pair.slice(i + 1).trim());
-  }
-  return m;
-}
-function jarString(m) {
-  return [...m].map(([k, v]) => k + '=' + v).join('; ');
+  pendingSet.set(origin, pending.slice(-50));
+  persistCookies();
 }
 
 async function handleCookiePush(req) {
+  await storeReady;
   try {
     const { origin, cookie } = await req.json();
-    if (origin && /^https?:/.test(origin)) {
-      const jar = jarMap(jars.get(origin));
-      for (const [k, v] of jarMap(cookie)) jar.set(k, v);
-      jars.set(origin, jarString(jar));
+    if (origin && /^https?:/.test(origin) && typeof cookie === 'string') {
+      for (const pair of cookie.split(';')) {
+        const i = pair.indexOf('=');
+        if (i > 0) store.setFromPage(origin, pair.slice(0, i).trim(), pair.slice(i + 1).trim());
+      }
+      persistCookies();
     }
   } catch {}
   return new Response(null, { status: 204 });

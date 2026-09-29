@@ -1,12 +1,15 @@
 // ─────────────────────────────────────────────────────────────────────────
-// HTMLTools Browser — page runtime (injected into every proxied page).
+// HTMLTools Browser — page runtime (injected into every proxied page). v1.1
 //
-// Runs INSIDE the proxied page and teaches it our URL scheme:
-//   fetch / XHR / window.open / links / forms / history / dynamic DOM.
-// Also emulates document.cookie per real origin.
+// Teaches proxied pages our URL scheme and makes them behave like they run
+// on their real origin, the way a real browser would:
+//   fetch / XHR / WebSocket / EventSource / sendBeacon / Worker /
+//   window.open / links / forms / history / dynamic DOM
+//   document.cookie (per real origin, HttpOnly-aware)
+//   localStorage + sessionStorage (per real origin, namespaced)
 //
-// __HT_KEY__ and __HT_PREFIX__ are replaced by the service worker at
-// install time with the real values, so this always matches the engine.
+// __HT_KEY__ / __HT_PREFIX__ / __HT_BACKEND__ are replaced by the service
+// worker at install time, so this always matches the engine.
 // ─────────────────────────────────────────────────────────────────────────
 (function () {
   if (window.__htmltools) return;
@@ -14,6 +17,8 @@
 
   var KEY = '__HT_KEY__';
   var PREFIX = '__HT_PREFIX__';
+  var BACKEND = '__HT_BACKEND__';
+  var WS_BACKEND = BACKEND.replace(/^http/i, 'ws');
 
   // The real URL of this page (injected just before this script loads).
   var REAL_URL =
@@ -31,6 +36,11 @@
   function b64url(s) {
     return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   }
+  function unb64url(s) {
+    var b = s.replace(/-/g, '+').replace(/_/g, '/');
+    while (b.length % 4) b += '=';
+    return atob(b);
+  }
   function toProxy(abs) {
     if (!/^https?:/i.test(abs)) return abs;
     return PREFIX + '~/' + b64url(xorStr(encodeURIComponent(abs)));
@@ -43,7 +53,6 @@
     }
   }
   var SKIP = /^(#|data:|blob:|about:|mailto:|tel:|sms:|javascript:)/i;
-  // value → proxied value (only if it can be a real http(s) URL)
   function px(u) {
     var v = String(u);
     if (!v || SKIP.test(v.trim())) return u;
@@ -170,7 +179,7 @@
     } catch (e) {}
   }
 
-  // Boot: pull any upstream Set-Cookie the SW saved for us, merge into jar.
+  // Boot: pull upstream Set-Cookie the SW saved (non-HttpOnly only) → jar.
   (function syncCookies() {
     _fetch(PREFIX + '~/__ht/sync?o=' + encodeURIComponent(realOrigin))
       .then(function (r) { return r.json(); })
@@ -188,7 +197,200 @@
       .catch(function () {});
   })();
 
-  // ── 7. dynamic DOM: rewrite nodes the page adds later ──────────────────
+  // ── 7. localStorage / sessionStorage emulation (per real origin) ───────
+  // All proxied sites share the real htmltools.me storage, so every key is
+  // namespaced with the site's origin. Pages see clean per-site storage.
+  (function () {
+    var nativeLS = window.localStorage;
+    var nativeSS = window.sessionStorage;
+    var NS = '__ht__' + b64url(realOrigin) + '__';
+
+    function NsStore(native) {
+      this._n = native;
+    }
+    NsStore.prototype = {
+      _keys: function () {
+        var out = [], n = this._n;
+        for (var i = 0; i < n.length; i++) {
+          var k = n.key(i);
+          if (k && k.indexOf(NS) === 0) out.push(k.slice(NS.length));
+        }
+        return out;
+      },
+      getItem: function (k) { return this._n.getItem(NS + String(k)); },
+      setItem: function (k, v) { this._n.setItem(NS + String(k), String(v)); },
+      removeItem: function (k) { this._n.removeItem(NS + String(k)); },
+      key: function (i) { return this._keys()[i] || null; },
+      clear: function () {
+        var n = this._n;
+        this._keys().forEach(function (k) { n.removeItem(NS + k); });
+      },
+    };
+    Object.defineProperty(NsStore.prototype, 'length', {
+      get: function () { return this._keys().length; },
+    });
+
+    try {
+      Object.defineProperty(window, 'localStorage', {
+        configurable: true,
+        get: function () { return lsShim; },
+      });
+      Object.defineProperty(window, 'sessionStorage', {
+        configurable: true,
+        get: function () { return ssShim; },
+      });
+    } catch (e) {}
+    var lsShim = new NsStore(nativeLS);
+    var ssShim = new NsStore(nativeSS);
+  })();
+
+  // ── 8. WebSocket proxying ──────────────────────────────────────────────
+  // Connects to OUR backend over wss; the backend dials the real ws://
+  // server and pipes frames both ways, preserving text/binary.
+  var _WS = window.WebSocket;
+  function resolveWs(u) {
+    var s = String(u || '');
+    var abs;
+    try {
+      if (/^wss?:/i.test(s)) {
+        abs = s;
+      } else if (s.indexOf('//') === 0) {
+        abs = (location.protocol === 'https:' ? 'wss:' : 'ws:') + s;
+      } else {
+        abs = new URL(s, REAL_URL).href;
+        abs = abs.replace(/^https:/i, 'wss:').replace(/^http:/i, 'ws:');
+      }
+    } catch (e) {
+      abs = s;
+    }
+    return abs;
+  }
+
+  function HTWebSocket(url, protocols) {
+    if (!(this instanceof HTWebSocket)) {
+      throw new TypeError("Failed to construct 'WebSocket': use 'new'.");
+    }
+    var self = this;
+    var abs = resolveWs(url);
+    this._url = abs;
+    this._binaryType = 'blob';
+    this._ls = { open: [], message: [], error: [], close: [] };
+
+    var handshake = b64url(JSON.stringify({
+      cookie: jarGet(),
+      origin: realOrigin,
+      protocol: protocols || null,
+    }));
+    var wire = WS_BACKEND + '/proxyws?u=' + encodeURIComponent(abs) + '&hd=' + encodeURIComponent(handshake);
+    // Protocols travel inside hd; none on the real handshake so the browser
+    // never expects a Sec-WebSocket-Protocol echo.
+    var real = new _WS(wire);
+    this._real = real;
+
+    real.addEventListener('open', function () { self._fire('open', new Event('open')); });
+    real.addEventListener('error', function () { self._fire('error', new Event('error')); });
+    real.addEventListener('close', function (e) {
+      self._fire('close', new CloseEvent('close', { code: e.code, reason: e.reason, wasClean: e.wasClean }));
+    });
+    real.addEventListener('message', function (e) {
+      var data = e.data;
+      if (data instanceof Blob && self._binaryType === 'arraybuffer') {
+        data.arrayBuffer().then(function (buf) {
+          self._fire('message', new MessageEvent('message', { data: buf }));
+        });
+      } else {
+        self._fire('message', new MessageEvent('message', { data: data }));
+      }
+    });
+  }
+  HTWebSocket.prototype._fire = function (type, event) {
+    event.target = this;
+    var list = this._ls[type].slice();
+    for (var i = 0; i < list.length; i++) {
+      try { list[i].call(this, event); } catch (e) {}
+    }
+    var h = this['on' + type];
+    if (typeof h === 'function') {
+      try { h.call(this, event); } catch (e) {}
+    }
+  };
+  HTWebSocket.prototype.addEventListener = function (t, fn, opts) {
+    if (this._ls[t]) this._ls[t].push(fn);
+  };
+  HTWebSocket.prototype.removeEventListener = function (t, fn) {
+    var l = this._ls[t];
+    if (!l) return;
+    var i = l.indexOf(fn);
+    if (i !== -1) l.splice(i, 1);
+  };
+  HTWebSocket.prototype.send = function (data) { return this._real.send(data); };
+  HTWebSocket.prototype.close = function (code, reason) { this._real.close(code, reason); };
+  Object.defineProperty(HTWebSocket.prototype, 'url', { get: function () { return this._url; } });
+  Object.defineProperty(HTWebSocket.prototype, 'readyState', {
+    get: function () { return this._real.readyState; },
+  });
+  Object.defineProperty(HTWebSocket.prototype, 'bufferedAmount', {
+    get: function () { return this._real.bufferedAmount; },
+  });
+  Object.defineProperty(HTWebSocket.prototype, 'extensions', {
+    get: function () { return this._real.extensions; },
+  });
+  Object.defineProperty(HTWebSocket.prototype, 'protocol', {
+    get: function () { return this._real.protocol; },
+  });
+  Object.defineProperty(HTWebSocket.prototype, 'binaryType', {
+    get: function () { return this._binaryType; },
+    set: function (v) {
+      this._binaryType = v === 'arraybuffer' ? 'arraybuffer' : 'blob';
+      this._real.binaryType = 'blob';
+    },
+  });
+  HTWebSocket.CONNECTING = 0;
+  HTWebSocket.OPEN = 1;
+  HTWebSocket.CLOSING = 2;
+  HTWebSocket.CLOSED = 3;
+  try { window.WebSocket = HTWebSocket; } catch (e) {}
+
+  // ── 9. EventSource / sendBeacon / Workers ──────────────────────────────
+  var _ES = window.EventSource;
+  if (_ES) {
+    var HTES = function (url, cfg) { return new _ES(px(url), cfg); };
+    HTES.prototype = _ES.prototype;
+    ['CONNECTING', 'OPEN', 'CLOSED'].forEach(function (k) { HTES[k] = _ES[k]; });
+    try { window.EventSource = HTES; } catch (e) {}
+  }
+
+  if (navigator.sendBeacon) {
+    navigator.sendBeacon = function (url, data) {
+      try {
+        _fetch(px(url), { method: 'POST', body: data, keepalive: true });
+        return true;
+      } catch (e) {
+        return false;
+      }
+    };
+  }
+
+  var _Worker = window.Worker;
+  if (_Worker) {
+    var HTWorker = function (url, opts) {
+      try { url = px(url); } catch (e) {}
+      return new _Worker(url, opts);
+    };
+    HTWorker.prototype = _Worker.prototype;
+    try { window.Worker = HTWorker; } catch (e) {}
+  }
+  var _SWC = window.SharedWorker;
+  if (_SWC) {
+    var HTSW = function (url, opts) {
+      try { url = px(url); } catch (e) {}
+      return new _SWC(url, opts);
+    };
+    HTSW.prototype = _SWC.prototype;
+    try { window.SharedWorker = HTSW; } catch (e) {}
+  }
+
+  // ── 10. dynamic DOM: rewrite nodes the page adds later ─────────────────
   var obs = new MutationObserver(function (muts) {
     for (var i = 0; i < muts.length; i++) {
       var added = muts[i].addedNodes;

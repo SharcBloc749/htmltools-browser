@@ -11,6 +11,13 @@
 //          server/main.ts. Free tier, no card.
 // ─────────────────────────────────────────────────────────────────────────
 
+function b64urlDecode(s: string): string {
+  const b = s.replace(/-/g, '+').replace(/_/g, '/');
+  const padded = b + '='.repeat((4 - (b.length % 4)) % 4);
+  const bin = atob(padded);
+  return new TextDecoder().decode(Uint8Array.from(bin, (c) => c.charCodeAt(0)));
+}
+
 // Request headers we allow through to the upstream site.
 const REQ_ALLOW = new Set([
   'accept',
@@ -51,10 +58,12 @@ const CORS: Record<string, string> = {
   'access-control-max-age': '86400',
 };
 
-Deno.serve({ port: Number(Deno.env.get('PORT') ?? 8787) }, async (req: Request) => {
+export async function handler(req: Request): Promise<Response> {
   const url = new URL(req.url);
 
   if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
+
+  if (url.pathname === '/proxyws') return proxyWs(req);
 
   if (url.pathname === '/' || url.pathname === '/health') {
     return Response.json(
@@ -80,7 +89,7 @@ Deno.serve({ port: Number(Deno.env.get('PORT') ?? 8787) }, async (req: Request) 
   const hd = url.searchParams.get('hd');
   if (hd) {
     try {
-      fwd = JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(hd.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0))));
+      fwd = JSON.parse(b64urlDecode(hd));
     } catch { /* ignore malformed */ }
   }
 
@@ -124,4 +133,92 @@ Deno.serve({ port: Number(Deno.env.get('PORT') ?? 8787) }, async (req: Request) 
   };
 
   return new Response(upstream.body, { status: 200, headers: outHeaders });
-});
+}
+
+// ── WebSocket relay ──────────────────────────────────────────────────────
+// /proxyws?u=<ws(s) target>&hd=<b64url JSON {cookie, origin, protocol}>
+// Upgrades the browser connection, dials the real server, pipes frames.
+function proxyWs(req: Request): Response {
+  const url = new URL(req.url);
+  if ((req.headers.get('upgrade') || '').toLowerCase() !== 'websocket') {
+    return new Response('expected websocket upgrade', { status: 400, headers: CORS });
+  }
+
+  const target = url.searchParams.get('u') ?? '';
+  let t: URL;
+  try {
+    t = new URL(target);
+    if (t.protocol !== 'ws:' && t.protocol !== 'wss:') throw new Error('bad scheme');
+  } catch {
+    return new Response('bad or missing ?u=', { status: 400, headers: CORS });
+  }
+
+  let fwd: Record<string, unknown> = {};
+  const hd = url.searchParams.get('hd');
+  if (hd) {
+    try {
+      fwd = JSON.parse(b64urlDecode(hd));
+    } catch { /* ignore malformed */ }
+  }
+
+  const { socket: client, response } = Deno.upgradeWebSocket(req);
+
+  let upstream: WebSocket;
+  try {
+    const protocol = typeof fwd.protocol === 'string' && fwd.protocol ? [fwd.protocol] : [];
+    upstream = protocol.length ? new WebSocket(t.href, protocol) : new WebSocket(t.href);
+    upstream.binaryType = 'arraybuffer';
+  } catch {
+    try { client.close(1011, 'upstream dial failed'); } catch { /* ignore */ }
+    return response;
+  }
+
+  // Buffer client frames until the upstream socket is open — the browser's
+  // "open" fires on the *upgrade*, which can beat the upstream dial.
+  const queue: (string | ArrayBuffer | Uint8Array)[] = [];
+  let upstreamOpen = false;
+
+  upstream.onopen = () => {
+    upstreamOpen = true;
+    for (const f of queue.splice(0)) {
+      try { upstream.send(f as string); } catch { /* ignore */ }
+    }
+  };
+  upstream.onmessage = async (e: MessageEvent) => {
+    try {
+      let data: unknown = e.data;
+      if (data instanceof Blob) data = new Uint8Array(await data.arrayBuffer());
+      if (client.readyState === WebSocket.OPEN) client.send(data as string | ArrayBuffer);
+    } catch { /* ignore */ }
+  };
+  upstream.onerror = () => {
+    try { client.close(1011, 'upstream error'); } catch { /* ignore */ }
+  };
+  upstream.onclose = (e: CloseEvent) => {
+    try { client.close(e.code, e.reason); } catch { /* ignore */ }
+  };
+
+  client.onmessage = async (e: MessageEvent) => {
+    try {
+      let data: unknown = e.data;
+      if (data instanceof Blob) data = new Uint8Array(await data.arrayBuffer());
+      if (!upstreamOpen) {
+        queue.push(data as string);
+        return;
+      }
+      if (upstream.readyState === WebSocket.OPEN) upstream.send(data as string | ArrayBuffer);
+    } catch { /* ignore */ }
+  };
+  client.onclose = (e: CloseEvent) => {
+    try { upstream.close(e.code || 1000, e.reason); } catch { /* ignore */ }
+  };
+  client.onerror = () => {
+    try { upstream.close(); } catch { /* ignore */ }
+  };
+
+  return response;
+}
+
+if (import.meta.main) {
+  Deno.serve({ port: Number(Deno.env.get('PORT') ?? 8787) }, handler);
+}

@@ -1,6 +1,7 @@
 // HTMLTools Browser — engine unit tests. Run: node tests/test.mjs
 import { encodeUrl, decodeUrl } from '../client/encoder.js';
 import { rewriteHtml, rewriteCss } from '../client/rewrite.js';
+import { makeStore, parseSetCookie, domainMatch, pathMatch, defaultPath } from '../client/cookiestore.js';
 
 let pass = 0, fail = 0;
 function eq(actual, expected, label) {
@@ -60,6 +61,60 @@ const cssOut = rewriteCss(css, 'https://target.example/dir/page.html', enc);
 ok(cssOut.includes('url("' + enc('https://fonts.example/f.woff2') + '")'), 'absolute url() rewritten');
 ok(cssOut.includes('url("' + enc('https://target.example/abs.png') + '")'), 'root-relative url() rewritten');
 ok(cssOut.includes('url("' + enc('https://target.example/dir/rel.png') + '")'), 'relative url() rewritten');
+
+
+console.log('\n\u2500 cookie store (v1.1) \u2500');
+{
+  const base = 'https://accounts.example.com/login';
+
+  const c1 = parseSetCookie('session=abc123; Path=/; HttpOnly; Secure; SameSite=Lax', base);
+  ok(c1 && c1.name === 'session' && c1.value === 'abc123', 'basic parse');
+  ok(c1 && c1.httpOnly === true && c1.secure === true, 'HttpOnly + Secure parsed');
+
+  const c2 = parseSetCookie('prefs=dark; Domain=example.com; Max-Age=3600', base);
+  ok(c2 && c2.hostOnly === false && c2.domain === 'example.com', 'Domain attr makes it a domain cookie');
+  ok(c2 && c2.expiresTs !== null && c2.expiresTs > Date.now(), 'Max-Age sets expiry');
+
+  const c3 = parseSetCookie('x=1; Domain=other.com', base);
+  eq(c3, null, 'cookie for wrong domain rejected');
+
+  const c4 = parseSetCookie('x=1; Secure', 'http://example.com/');
+  eq(c4, null, 'Secure cookie rejected over http');
+
+  ok(domainMatch('a.b.example.com', 'example.com'), 'domain suffix match');
+  ok(!domainMatch('example.com', 'a.example.com'), 'parent does not match subdomain cookie');
+  ok(!domainMatch('notexample.com', 'example.com'), 'suffix must be dot-bounded');
+  ok(pathMatch('/a/b/c', '/a'), 'path prefix match');
+  ok(!pathMatch('/abc', '/a'), 'path must be segment-bounded');
+  eq(defaultPath('/a/b/c.html'), '/a/b', 'default path = directory');
+
+  const s = makeStore();
+  s.set(parseSetCookie('a=1; Path=/', 'https://example.com/x/y'));
+  s.set(parseSetCookie('b=2; Path=/x', 'https://example.com/x/y'));
+  s.set(parseSetCookie('pub=3; Domain=example.com', 'https://example.com/'));
+  s.set(parseSetCookie('secret=9; Path=/; HttpOnly', 'https://example.com/'));
+  eq(s.forUrl('https://example.com/x/y'), 'b=2; a=1; pub=3; secret=9', 'longer paths first, all included in header');
+  const visible = s.forUrlVisible('https://example.com/x/y');
+  ok(visible.includes('a=1') && !visible.includes('secret=9'), 'HttpOnly hidden from document.cookie');
+
+  s.set(parseSetCookie('gone=1; Max-Age=0', 'https://example.com/'));
+  eq(s.forUrl('https://example.com/').includes('gone=1'), false, 'Max-Age=0 deletes');
+
+  const expired = parseSetCookie('old=1; Expires=Thu, 01 Jan 1970 00:00:00 GMT', 'https://example.com/');
+  ok(expired && expired.expiresTs === 0, 'past Expires \u2192 expired');
+
+  s.set(parseSetCookie('sess=ok', 'https://example.com/deep/path'));
+  eq(s.forUrl('https://example.com/other').includes('sess=ok'), false, 'default-path cookie scoped to /deep');
+  ok(s.forUrl('https://example.com/deep/anything').includes('sess=ok'), 'default-path cookie matches its subtree');
+
+  s.set(parseSetCookie('sub=1; Domain=example.com', 'https://example.com/'));
+  ok(s.forUrl('https://api.example.com/v1').includes('sub=1'), 'domain cookie reaches subdomains');
+
+  const secStore = makeStore();
+  secStore.set(parseSetCookie('s=1; Secure', 'https://example.com/'));
+  eq(secStore.forUrl('http://example.com/'), '', 'Secure cookie not sent over http');
+  ok(secStore.forUrl('https://example.com/').includes('s=1'), 'Secure cookie sent over https');
+}
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

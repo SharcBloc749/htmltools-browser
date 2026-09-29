@@ -15,6 +15,21 @@ backend, $0/month, no bank account needed anywhere.
 └─────────────────────────┘        └──────────────────────────────┘
 ```
 
+## What's new in v1.1 — "real browser" mode
+
+- **Persistent cookie store.** Real Domain/Path/Expires/Max-Age/Secure/
+  HttpOnly semantics, saved to IndexedDB — **logins survive browser
+  restarts** now. `document.cookie` emulation stays per-site and HttpOnly
+  cookies stay invisible to page JS, exactly like Chrome.
+- **Per-site localStorage + sessionStorage.** Every site gets its own
+  namespaced storage — no more sites fighting over the same keys.
+- **WebSocket proxying.** `/proxyws` on the backend dials real `ws(s)://`
+  servers and pipes frames both ways (text + binary). The page runtime
+  swaps in a drop-in `WebSocket`, so chat apps, live scores, and games
+  light up.
+- **EventSource (SSE), `navigator.sendBeacon`, and Worker URLs** are
+  routed through the engine too.
+
 ## Why this is faster than GUST
 
 | GUST | HTMLTools Browser |
@@ -87,7 +102,7 @@ tests/
   test.mjs      23 engine unit tests — npm test
 ```
 
-## Honest limitations (v1)
+## Honest limitations (v1.1)
 
 - **Google will still CAPTCHA you sometimes.** That's IP reputation, not
   engine quality — every proxy on a datacenter IP has this, including GUST.
@@ -96,16 +111,21 @@ tests/
 - Very JS-heavy SPAs that hardcode `https://...` strings inside scripts can
   still leak requests around the engine (full AST rewriting of JS is the
   roadmap item — that's what Ultraviolet/Scramjet spend years on).
-- Cookies are v1: per-origin jar survives while the SW lives; logins work
-  on most sites but aren't bulletproof yet.
-- WebSockets inside proxied sites aren't proxied yet.
-- `localStorage`/`sessionStorage` inside pages is shared across proxied
-  sites (cookie jar is properly separated; storage separation is roadmap).
+- **Google logins**: technically better now (real cookie semantics), but
+  still don't log your main Google account into any proxy — CAPTCHAs +
+  account-security flags are about the IP, and your credentials traverse
+  your backend. Use throwaways.
+- IndexedDB inside proxied pages is still shared across sites (cookies and
+  localStorage are separated; IDB is the remaining overlap).
+- reCAPTCHA/hCaptcha widgets may still complain (they check the visible
+  domain, which is htmltools.me).
+- Deno Deploy supports WebSockets; if some specific WS target misbehaves
+  there, run the same `server/main.ts` on a VPS — zero code changes.
 
 ## Roadmap ideas
 
 - Streaming HTML rewriter (never buffer big pages)
 - Tabs, bookmarks, history, themes (the GUST feature set)
-- WebSocket proxying
 - Multiple backends + automatic failover/fastest-pick
+- IndexedDB namespacing per site
 - Single-file export (build script), if you ever want GUST-style portability
