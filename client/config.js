@@ -5,7 +5,7 @@
 
 // 1) URL of your proxy backend (deploy server/main.ts to deno.dev — free,
 //    no card — then paste the URL you get here).
-export const BACKEND = 'https://htmltools-proxy.deno.dev';
+export const BACKEND = 'https://htmltools-browser-nqv1xw3k6rph.htmltools-browser.deno.net/';
 
 // 2) Default search engine for non-URL input in the address bar.
 export const SEARCH = 'https://duckduckgo.com/?q=';
