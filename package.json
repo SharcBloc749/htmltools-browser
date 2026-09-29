@@ -1,0 +1,12 @@
+{
+  "name": "htmltools-browser",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Fast single-proxy browser engine: Cloudflare Pages frontend + Deno backend",
+  "scripts": {
+    "test": "node tests/test.mjs",
+    "dev:server": "deno run -A server/main.ts",
+    "dev:client": "python3 -m http.server 8080 -d client"
+  }
+}
