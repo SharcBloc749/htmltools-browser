@@ -1,224 +1,216 @@
-// ─────────────────────────────────────────────────────────────────────────
-// HTMLTools Browser — proxy backend (Deno).
+// HTMLTools Browser — proxy backend v2.0.0  (Deno Deploy, free tier)
 //
-// Deliberately dumb and stateless: it receives a target URL + forwarded
-// headers, streams the upstream response back with CORS opened up, and
-// relays status/headers/set-cookies through two x-proxy-* headers.
-// No WASM. No WebSocket relay. No storage. Deploy it anywhere Deno runs.
+// Same protocol as v1 (the app needs no changes to talk to it):
+//   GET/POST/... /proxy?url=<target>&hd=<base64url JSON of request headers>
+//       -> always HTTP 200; real status in  x-proxy-status ; upstream headers in x-proxy-headers (JSON)
+//   WebSocket  /proxyws?u=<wss target>&hd=<base64url JSON {cookie, origin, protocol}>
+//   GET /  (health)
 //
-// Local:   deno run -A server/main.ts        → http://localhost:8787
-// Deploy:  deno.dev → New Project → import this repo → entrypoint
-//          server/main.ts. Free tier, no card.
-// ─────────────────────────────────────────────────────────────────────────
+// What's new in v2:
+//   * ORIGIN LOCK  – only https://htmltools.me (and www) may use it. Other sites get 403.
+//                    Extra origins (e.g. a preview URL) can be added WITHOUT editing code:
+//                    set the env var  ALLOW_ORIGINS  = "https://a.example,https://b.example"
+//   * FULL HEADER FORWARDING – every header the page set (x-goog-api-key, x-csrf-token,
+//     sec-ch-ua, sec-fetch-*, ...) now reaches the target site. v1 only forwarded ~10, which
+//     broke YouTube's bot-check API, many logins and many SPAs.
+//   * Blocks requests aimed at private/internal addresses (SSRF protection).
 
-function b64urlDecode(s: string): string {
-  const b = s.replace(/-/g, '+').replace(/_/g, '/');
-  const padded = b + '='.repeat((4 - (b.length % 4)) % 4);
-  const bin = atob(padded);
-  return new TextDecoder().decode(Uint8Array.from(bin, (c) => c.charCodeAt(0)));
+const VERSION = "2.0.0";
+
+const ALLOWED = new Set<string>([
+  "https://htmltools.me",
+  "https://www.htmltools.me",
+]);
+for (const o of (Deno.env.get("ALLOW_ORIGINS") || "").split(",")) {
+  const t = o.trim().replace(/\/+$/, "");
+  if (t) ALLOWED.add(t);
 }
 
-// Request headers we allow through to the upstream site.
-const REQ_ALLOW = new Set([
-  'accept',
-  'accept-language',
-  'authorization',
-  'content-type',
-  'cookie',
-  'if-modified-since',
-  'if-none-match',
-  'if-range',
-  'origin',
-  'range',
-  'referer',
-  'user-agent',
+// Request headers that must never be forwarded upstream.
+const DROP_REQ =
+  /^(host|content-length|connection|keep-alive|transfer-encoding|upgrade|te|trailer|proxy-.*|x-forwarded-.*|x-real-ip|forwarded|via|cdn-loop|x-deno-.*|traceparent|tracestate|accept-encoding|expect)$/i;
+
+// Upstream response headers handed back to the app (inside x-proxy-headers).
+const KEEP_RES = new Set([
+  "content-type", "content-range", "accept-ranges", "cache-control", "etag",
+  "last-modified", "expires", "content-disposition", "www-authenticate", "vary",
+  "location", "refresh", "link",
 ]);
 
-// Response headers we relay back to the service worker (inside the JSON).
-const RES_ALLOW = [
-  'content-type',
-  'content-range',
-  'accept-ranges',
-  'cache-control',
-  'etag',
-  'last-modified',
-  'expires',
-  'location',
-  'refresh',
-  'content-disposition',
-  'www-authenticate',
-  'vary',
-];
-
-const CORS: Record<string, string> = {
-  'access-control-allow-origin': '*',
-  'access-control-allow-methods': 'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS',
-  'access-control-allow-headers': '*',
-  'access-control-expose-headers': 'x-proxy-status, x-proxy-headers',
-  'access-control-max-age': '86400',
-};
-
-export async function handler(req: Request): Promise<Response> {
-  const url = new URL(req.url);
-
-  if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
-
-  if (url.pathname === '/proxyws') return proxyWs(req);
-
-  if (url.pathname === '/' || url.pathname === '/health') {
-    return Response.json(
-      { service: 'htmltools-proxy', ok: true, version: '1.0.0' },
-      { headers: CORS },
-    );
-  }
-  if (url.pathname !== '/proxy') {
-    return new Response('not found', { status: 404, headers: CORS });
-  }
-
-  const target = url.searchParams.get('url') ?? '';
-  let parsed: URL;
-  try {
-    parsed = new URL(target);
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('bad scheme');
-  } catch {
-    return new Response('bad or missing ?url=', { status: 400, headers: CORS });
-  }
-
-  // Forwarded headers ride in ?hd= (base64url JSON) to avoid CORS preflights.
-  let fwd: Record<string, string> = {};
-  const hd = url.searchParams.get('hd');
-  if (hd) {
-    try {
-      fwd = JSON.parse(b64urlDecode(hd));
-    } catch { /* ignore malformed */ }
-  }
-
-  const upstreamHeaders: Record<string, string> = {};
-  for (const [k, v] of Object.entries(fwd)) {
-    if (REQ_ALLOW.has(k.toLowerCase()) && typeof v === 'string') upstreamHeaders[k.toLowerCase()] = v;
-  }
-
-  let upstream: Response;
-  try {
-    upstream = await fetch(parsed.href, {
-      method: req.method === 'HEAD' ? 'GET' : req.method,
-      headers: upstreamHeaders,
-      body: req.method === 'GET' || req.method === 'HEAD' ? undefined : await req.arrayBuffer(),
-      redirect: 'manual',
-      signal: AbortSignal.timeout(45_000),
-    });
-  } catch (err) {
-    return Response.json(
-      { error: 'upstream_failed', detail: String((err as Error)?.message ?? err) },
-      { status: 504, headers: CORS },
-    );
-  }
-
-  // Fold upstream status + headers into two inspectable headers.
-  const meta: Record<string, string | string[]> = {};
-  for (const h of RES_ALLOW) {
-    const v = upstream.headers.get(h);
-    if (v) meta[h] = v;
-  }
-  const setCookies = typeof upstream.headers.getSetCookie === 'function'
-    ? upstream.headers.getSetCookie()
-    : [];
-  if (setCookies.length) meta['set-cookie'] = setCookies;
-
-  const outHeaders: Record<string, string> = {
-    ...CORS,
-    'x-proxy-status': String(upstream.status),
-    'x-proxy-headers': JSON.stringify(meta),
-    'content-type': 'application/octet-stream', // real type travels in meta
-  };
-
-  return new Response(upstream.body, { status: 200, headers: outHeaders });
+function callerOrigin(req: Request): string {
+  const o = req.headers.get("origin");
+  if (o) return o;
+  const r = req.headers.get("referer");
+  if (r) { try { return new URL(r).origin; } catch { /* ignore */ } }
+  return "";
 }
 
-// ── WebSocket relay ──────────────────────────────────────────────────────
-// /proxyws?u=<ws(s) target>&hd=<b64url JSON {cookie, origin, protocol}>
-// Upgrades the browser connection, dials the real server, pipes frames.
-function proxyWs(req: Request): Response {
-  const url = new URL(req.url);
-  if ((req.headers.get('upgrade') || '').toLowerCase() !== 'websocket') {
-    return new Response('expected websocket upgrade', { status: 400, headers: CORS });
-  }
+function corsHeaders(origin: string): Record<string, string> {
+  return {
+    "access-control-allow-origin": origin,
+    "vary": "origin",
+    "access-control-allow-methods": "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
+    "access-control-allow-headers": "*",
+    "access-control-expose-headers": "x-proxy-status, x-proxy-headers",
+    "access-control-max-age": "86400",
+  };
+}
 
-  const target = url.searchParams.get('u') ?? '';
-  let t: URL;
+function isPrivateHost(host: string): boolean {
+  const h = host.toLowerCase().replace(/^\[|\]$/g, "");
+  if (h === "localhost" || h.endsWith(".localhost") || h.endsWith(".internal") || h.endsWith(".local")) return true;
+  if (h === "::1" || h === "::" || h.startsWith("fc") || h.startsWith("fd") || h.startsWith("fe80")) return h.includes(":");
+  const m = h.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (m) {
+    const [a, b] = [parseInt(m[1]), parseInt(m[2])];
+    return a === 10 || a === 127 || a === 0 || (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || a >= 224;
+  }
+  return false;
+}
+
+function b64urlDecodeJson(s: string | null): Record<string, unknown> {
+  if (!s) return {};
   try {
-    t = new URL(target);
-    if (t.protocol !== 'ws:' && t.protocol !== 'wss:') throw new Error('bad scheme');
-  } catch {
-    return new Response('bad or missing ?u=', { status: 400, headers: CORS });
+    let b = s.replace(/-/g, "+").replace(/_/g, "/");
+    while (b.length % 4) b += "=";
+    const bin = atob(b);
+    const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+    const obj = JSON.parse(new TextDecoder().decode(bytes));
+    return obj && typeof obj === "object" ? obj : {};
+  } catch { return {}; }
+}
+
+// HTTP header values must be ASCII: escape everything else as \uXXXX inside the JSON.
+function asciiJson(o: unknown): string {
+  return JSON.stringify(o).replace(/[\u007f-\uffff]/g, (c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
+}
+
+function json(status: number, body: unknown, extra: Record<string, string> = {}): Response {
+  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...extra } });
+}
+
+async function handleProxy(req: Request, url: URL, cors: Record<string, string>): Promise<Response> {
+  const target = url.searchParams.get("url") || "";
+  let t: URL;
+  try { t = new URL(target); } catch { return new Response("bad or missing ?url=", { status: 400, headers: cors }); }
+  if (t.protocol !== "http:" && t.protocol !== "https:") {
+    return new Response("bad or missing ?url=", { status: 400, headers: cors });
+  }
+  if (isPrivateHost(t.hostname)) return json(403, { error: "blocked_target" }, cors);
+
+  const hd = b64urlDecodeJson(url.searchParams.get("hd"));
+  const headers = new Headers();
+  for (const [k, v] of Object.entries(hd)) {
+    if (typeof v !== "string" || !v || DROP_REQ.test(k)) continue;
+    try { headers.set(k, v); } catch { /* invalid header name/value: skip */ }
   }
 
-  let fwd: Record<string, unknown> = {};
-  const hd = url.searchParams.get('hd');
-  if (hd) {
-    try {
-      fwd = JSON.parse(b64urlDecode(hd));
-    } catch { /* ignore malformed */ }
+  const method = req.method.toUpperCase();
+  const body = method === "GET" || method === "HEAD" ? undefined : await req.arrayBuffer();
+
+  // Timeout applies to receiving the response HEADERS only (streams can run long).
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 30000);
+  let up: Response;
+  try {
+    up = await fetch(t.href, { method, headers, body, redirect: "manual", signal: ac.signal });
+  } catch (e) {
+    clearTimeout(timer);
+    return json(504, { error: "upstream_failed", detail: String((e as Error)?.message || e) }, cors);
   }
+  clearTimeout(timer);
+
+  const meta: Record<string, unknown> = {};
+  up.headers.forEach((v, k) => { if (KEEP_RES.has(k.toLowerCase())) meta[k.toLowerCase()] = v; });
+  const sc = up.headers.getSetCookie?.() ?? [];
+  if (sc.length) meta["set-cookie"] = sc;
+
+  const noBody = method === "HEAD" || up.status === 204 || up.status === 304 || (up.status >= 100 && up.status < 200);
+  return new Response(noBody ? null : up.body, {
+    status: 200,
+    headers: {
+      ...cors,
+      "content-type": "application/octet-stream",
+      "x-proxy-status": String(up.status),
+      "x-proxy-headers": asciiJson(meta),
+    },
+  });
+}
+
+function handleWs(req: Request, url: URL): Response {
+  if ((req.headers.get("upgrade") || "").toLowerCase() !== "websocket") {
+    return new Response("expected websocket", { status: 426 });
+  }
+  const target = url.searchParams.get("u") || "";
+  let t: URL;
+  try { t = new URL(target); } catch { return new Response("bad ?u=", { status: 400 }); }
+  if ((t.protocol !== "wss:" && t.protocol !== "ws:") || isPrivateHost(t.hostname)) {
+    return new Response("bad ?u=", { status: 400 });
+  }
+  const hd = b64urlDecodeJson(url.searchParams.get("hd"));
 
   const { socket: client, response } = Deno.upgradeWebSocket(req);
+  client.binaryType = "arraybuffer";
+
+  const hdrs: Record<string, string> = {};
+  if (typeof hd.cookie === "string" && hd.cookie) hdrs["cookie"] = hd.cookie;
+  hdrs["origin"] = typeof hd.origin === "string" && hd.origin ? hd.origin : t.origin.replace(/^ws/, "http");
+  const protocols = Array.isArray(hd.protocol) ? (hd.protocol as string[]) : typeof hd.protocol === "string" ? [hd.protocol] : undefined;
 
   let upstream: WebSocket;
   try {
-    const protocol = typeof fwd.protocol === 'string' && fwd.protocol ? [fwd.protocol] : [];
-    upstream = protocol.length ? new WebSocket(t.href, protocol) : new WebSocket(t.href);
-    upstream.binaryType = 'arraybuffer';
+    // deno-lint-ignore no-explicit-any
+    upstream = new (WebSocket as any)(t.href, { headers: hdrs, protocols });
   } catch {
-    try { client.close(1011, 'upstream dial failed'); } catch { /* ignore */ }
-    return response;
+    try { upstream = new WebSocket(t.href, protocols); } catch { client.close(1011, "upstream_failed"); return response; }
   }
+  upstream.binaryType = "arraybuffer";
 
-  // Buffer client frames until the upstream socket is open — the browser's
-  // "open" fires on the *upgrade*, which can beat the upstream dial.
-  const queue: (string | ArrayBuffer | Uint8Array)[] = [];
-  let upstreamOpen = false;
-
-  upstream.onopen = () => {
-    upstreamOpen = true;
-    for (const f of queue.splice(0)) {
-      try { upstream.send(f as string); } catch { /* ignore */ }
-    }
+  const queue: (string | ArrayBuffer)[] = [];
+  client.onmessage = (e) => {
+    if (upstream.readyState === WebSocket.OPEN) upstream.send(e.data);
+    else queue.push(e.data);
   };
-  upstream.onmessage = async (e: MessageEvent) => {
+  upstream.onopen = () => { for (const m of queue.splice(0)) upstream.send(m); };
+  upstream.onmessage = (e) => { if (client.readyState === WebSocket.OPEN) client.send(e.data); };
+  const safeClose = (ws: WebSocket, code?: number, reason?: string) => {
     try {
-      let data: unknown = e.data;
-      if (data instanceof Blob) data = new Uint8Array(await data.arrayBuffer());
-      if (client.readyState === WebSocket.OPEN) client.send(data as string | ArrayBuffer);
-    } catch { /* ignore */ }
-  };
-  upstream.onerror = () => {
-    try { client.close(1011, 'upstream error'); } catch { /* ignore */ }
-  };
-  upstream.onclose = (e: CloseEvent) => {
-    try { client.close(e.code, e.reason); } catch { /* ignore */ }
-  };
-
-  client.onmessage = async (e: MessageEvent) => {
-    try {
-      let data: unknown = e.data;
-      if (data instanceof Blob) data = new Uint8Array(await data.arrayBuffer());
-      if (!upstreamOpen) {
-        queue.push(data as string);
-        return;
+      if (ws.readyState <= WebSocket.OPEN) {
+        const ok = code && code >= 1000 && code < 5000 && code !== 1005 && code !== 1006 && code !== 1015;
+        ws.close(ok ? code : 1000, reason || "");
       }
-      if (upstream.readyState === WebSocket.OPEN) upstream.send(data as string | ArrayBuffer);
     } catch { /* ignore */ }
   };
-  client.onclose = (e: CloseEvent) => {
-    try { upstream.close(e.code || 1000, e.reason); } catch { /* ignore */ }
-  };
-  client.onerror = () => {
-    try { upstream.close(); } catch { /* ignore */ }
-  };
-
+  client.onclose = (e) => safeClose(upstream, e.code, e.reason);
+  upstream.onclose = (e) => safeClose(client, e.code, e.reason);
+  upstream.onerror = () => safeClose(client, 1011, "upstream_error");
+  client.onerror = () => safeClose(upstream, 1011, "client_error");
   return response;
 }
 
-if (import.meta.main) {
-  Deno.serve({ port: Number(Deno.env.get('PORT') ?? 8787) }, handler);
+async function handler(req: Request): Promise<Response> {
+  const url = new URL(req.url);
+
+  // Health check stays public.
+  if (url.pathname === "/" || url.pathname === "/health") {
+    return json(200, { service: "htmltools-proxy", ok: true, version: VERSION }, { "access-control-allow-origin": "*" });
+  }
+
+  // ── origin lock ──
+  const origin = callerOrigin(req);
+  if (!ALLOWED.has(origin)) {
+    return new Response("Forbidden: this proxy only works on htmltools.me", {
+      status: 403,
+      headers: { "content-type": "text/plain" },
+    });
+  }
+  const cors = corsHeaders(origin);
+
+  if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
+  if (url.pathname === "/proxy") return handleProxy(req, url, cors);
+  if (url.pathname === "/proxyws") return handleWs(req, url);
+  return new Response("not found", { status: 404, headers: cors });
 }
+
+Deno.serve(handler);
