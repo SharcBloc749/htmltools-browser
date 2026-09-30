@@ -7,15 +7,16 @@
 //   GET /  (health)
 //
 // What's new in v2:
-//   * ORIGIN LOCK  – only https://htmltools.me (and www) may use it. Other sites get 403.
-//                    Extra origins (e.g. a preview URL) can be added WITHOUT editing code:
-//                    set the env var  ALLOW_ORIGINS  = "https://a.example,https://b.example"
+//   * OPTIONAL ORIGIN LOCK (OFF by default – works from any site, like v1).
+//                    To restrict it to htmltools.me later, set the env var  LOCK_ORIGINS = 1
+//                    (extra allowed origins: env var ALLOW_ORIGINS = "https://a.example,https://b.example")
 //   * FULL HEADER FORWARDING – every header the page set (x-goog-api-key, x-csrf-token,
 //     sec-ch-ua, sec-fetch-*, ...) now reaches the target site. v1 only forwarded ~10, which
 //     broke YouTube's bot-check API, many logins and many SPAs.
 //   * Blocks requests aimed at private/internal addresses (SSRF protection).
 
-const VERSION = "2.0.0";
+const VERSION = "2.0.1";
+const LOCK = Deno.env.get("LOCK_ORIGINS") === "1";
 
 const ALLOWED = new Set<string>([
   "https://htmltools.me",
@@ -199,13 +200,13 @@ async function handler(req: Request): Promise<Response> {
 
   // ── origin lock ──
   const origin = callerOrigin(req);
-  if (!ALLOWED.has(origin)) {
+  if (LOCK && !ALLOWED.has(origin)) {
     return new Response("Forbidden: this proxy only works on htmltools.me", {
       status: 403,
       headers: { "content-type": "text/plain" },
     });
   }
-  const cors = corsHeaders(origin);
+  const cors = corsHeaders(LOCK ? origin : "*");
 
   if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
   if (url.pathname === "/proxy") return handleProxy(req, url, cors);
